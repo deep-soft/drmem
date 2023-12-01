@@ -2,12 +2,19 @@
 name: act-release
 on:
   workflow_dispatch:
+    inputs:
+      rust-version:
+        type: string
+        required: false
+        default: stable
+
   workflow_call:
     inputs:
       rust-version:
         type: string
         required: false
         default: stable
+
 #  push:
 #    branches: [ "main", "pr-*" ]
 #  pull_request:

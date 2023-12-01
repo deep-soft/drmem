@@ -36,9 +36,10 @@ jobs:
 
     steps:
     - name: Check out
-      uses: actions/checkout@v3
+      uses: deep-soft/checkout@v3
+
     - name: Set up cache
-      uses: actions/cache@v3
+      uses: deep-soft/cache@v3
       continue-on-error: false
       with:
         path: |
@@ -49,7 +50,23 @@ jobs:
           target/
         key: ${{ runner.os }}-cargo-${{ hashFiles('**/Cargo.lock') }}
         restore-keys: ${{ runner.os }}-cargo-
+
     - name: Lint
       run: cargo fmt --all -- --check
+
     - name: Run tests
       run: cargo test --verbose --workspace --features ${{ matrix.client }},${{ matrix.backend }}
+
+    - name: Build
+      shell: bash
+      run: cargo build --locked --release --target=${{ matrix.job.target }}
+
+    - name: Publish Release
+      uses: deep-soft/action-gh-release@v1
+      with:
+        draft: true
+        tag_name: ${{ env.TAG_NAME }}
+        files: |
+          target/release/*
+          ./SignOutput/*
+          ${{ env.ASSET_SRC }}

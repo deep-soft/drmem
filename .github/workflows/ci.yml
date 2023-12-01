@@ -7,10 +7,10 @@ on:
         type: string
         required: false
         default: stable
-  push:
-    branches: [ "main", "pr-*" ]
-  pull_request:
-    branches: [ "main", "pr-*" ]
+#  push:
+#    branches: [ "main", "pr-*" ]
+#  pull_request:
+#    branches: [ "main", "pr-*" ]
 
 env:
   CARGO_TERM_COLOR: always

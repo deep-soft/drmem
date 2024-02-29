@@ -16,8 +16,8 @@ fn def_log_level() -> String {
 pub struct Config {
     #[serde(default = "def_log_level")]
     log_level: String,
-    latitude: f64,
-    longitude: f64,
+    pub latitude: f64,
+    pub longitude: f64,
     #[cfg(feature = "graphql")]
     #[serde(default)]
     pub graphql: super::graphql::config::Config,
@@ -136,12 +136,12 @@ fn from_cmdline(mut cfg: Config) -> (bool, Config) {
 
 fn parse_config(contents: &str) -> Result<Config> {
     toml::from_str(contents)
-        .map_err(|e| Error::BadConfig(format!("{}", e)))
+        .map_err(|e| Error::ConfigError(format!("{}", e)))
         .and_then(|cfg: Config| {
             // Make sure latitude is between -90 and 90 degrees.
 
             if !(-90.0..=90.0).contains(&cfg.latitude) {
-                return Err(Error::BadConfig(
+                return Err(Error::ConfigError(
                     "'latitude' is out of range".into(),
                 ));
             }
@@ -149,7 +149,7 @@ fn parse_config(contents: &str) -> Result<Config> {
             // Make sure longitude is between -180 and 180 degrees.
 
             if !(-180.0..=180.0).contains(&cfg.longitude) {
-                return Err(Error::BadConfig(
+                return Err(Error::ConfigError(
                     "'longitude' is out of range".into(),
                 ));
             }

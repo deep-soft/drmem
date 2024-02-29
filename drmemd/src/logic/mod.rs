@@ -13,6 +13,7 @@ use tracing_futures::Instrument;
 use super::config;
 
 mod compile;
+pub mod solar;
 pub mod tod;
 
 // These are some helpful type aliases.
@@ -45,33 +46,44 @@ impl Output {
 
     // Attempts to set the associated device to a new value.
 
-    pub async fn send(&mut self, value: device::Value) {
-        // Only attempt the setting if the device isn't set to the
-        // value.
+    pub async fn send(&mut self, value: device::Value) -> bool {
+        // Only attempt the setting if it is different than the
+        // previous setting we sent.
 
-        if self.prev.as_ref() != Some(&value) {
-            let (tx_rpy, rx_rpy) = oneshot::channel();
-
-            if let Ok(()) = self.chan.send((value.clone(), tx_rpy)).await {
-                match rx_rpy.await {
-                    Ok(Ok(v)) => {
-                        // Save the value returned by the driver. This
-                        // should, hopefully, be the same that we
-                        // sent. If it isn't, add a warning to the
-                        // log.
-
-                        self.prev = Some(v.clone());
-                        if v != value {
-                            warn!("setting was adjusted")
-                        }
-                    }
-                    Ok(Err(e)) => error!("driver rejected setting : {}", &e),
-                    Err(e) => error!("setting failed : {}", &e),
-                }
-            } else {
-                error!("driver not accepting settings")
+        if let Some(prev) = self.prev.as_ref() {
+            if *prev == value {
+                return true;
             }
         }
+
+        // Create the reply channel.
+
+        let (tx_rpy, rx_rpy) = oneshot::channel();
+
+        // Send the setting to the driver.
+
+        if let Ok(()) = self.chan.send((value.clone(), tx_rpy)).await {
+            match rx_rpy.await {
+                Ok(Ok(v)) => {
+                    // If the driver adjusted our setting, add a
+                    // warning to the log.
+
+                    if v != value {
+                        warn!(
+                            "driver adjusted setting from {} to {}",
+                            &value, &v
+                        )
+                    }
+                    self.prev = Some(value);
+                    return true;
+                }
+                Ok(Err(e)) => error!("driver rejected setting : {}", &e),
+                Err(e) => error!("setting failed : {}", &e),
+            }
+        } else {
+            error!("driver not accepting settings")
+        }
+        false
     }
 }
 
@@ -80,6 +92,7 @@ pub struct Node {
     outputs: Vec<Output>,
     in_stream: InputStream,
     time_ch: Option<broadcast::Receiver<tod::Info>>,
+    solar_ch: Option<broadcast::Receiver<solar::Info>>,
     exprs: Vec<compile::Program>,
 }
 
@@ -156,6 +169,7 @@ impl Node {
     async fn init(
         c_req: client::RequestChan,
         c_time: broadcast::Receiver<tod::Info>,
+        c_solar: broadcast::Receiver<solar::Info>,
         cfg: &config::Logic,
     ) -> Result<Node> {
         debug!("compiling expressions");
@@ -193,6 +207,9 @@ impl Node {
         let needs_time =
             exprs.iter().any(|compile::Program(e, _)| e.uses_time());
 
+        let needs_solar =
+            exprs.iter().any(|compile::Program(e, _)| e.uses_solar());
+
         // Return the initialized `Node`.
 
         Ok(Node {
@@ -200,6 +217,7 @@ impl Node {
             outputs: out_chans,
             in_stream,
             time_ch: if needs_time { Some(c_time) } else { None },
+            solar_ch: if needs_solar { Some(c_solar) } else { None },
             exprs,
         })
     }
@@ -208,6 +226,7 @@ impl Node {
 
     async fn run(mut self) -> Result<Infallible> {
         let mut time = Arc::new((chrono::Utc::now(), chrono::Local::now()));
+        let mut solar = None;
 
         info!("starting");
 
@@ -235,6 +254,15 @@ impl Node {
 		    time = v;
 		    debug!("updated time");
 		}
+
+		// If we need the solar channel, wait for the next
+		// update.
+
+		Ok(v) = self.solar_ch.as_mut().unwrap().recv(),
+		            if self.solar_ch.is_some() => {
+		    solar = Some(v);
+		    debug!("updated solar position");
+		}
 	    }
 
             // Loop through each defined expression.
@@ -246,8 +274,10 @@ impl Node {
                 // values are None or the expression performed a bad
                 // operation, like dividing by 0.)
 
-                if let Some(result) = compile::eval(expr, &self.inputs, &time) {
-                    self.outputs[*idx].send(result).await
+                if let Some(result) =
+                    compile::eval(expr, &self.inputs, &time, solar.as_ref())
+                {
+                    let _ = self.outputs[*idx].send(result).await;
                 } else {
                     error!("couldn't evaluate {}", &expr)
                 }
@@ -260,6 +290,7 @@ impl Node {
     pub async fn start(
         c_req: client::RequestChan,
         rx_tod: broadcast::Receiver<tod::Info>,
+        rx_solar: broadcast::Receiver<solar::Info>,
         cfg: &config::Logic,
     ) -> Result<JoinHandle<Result<Infallible>>> {
         let name = cfg.name.clone();
@@ -267,7 +298,7 @@ impl Node {
         // Create a new instance and let it initialize itself. If an
         // error occurs, return it.
 
-        let node = Node::init(c_req, rx_tod, cfg)
+        let node = Node::init(c_req, rx_tod, rx_solar, cfg)
             .instrument(info_span!("logic-init", name = &name))
             .await?;
 
@@ -276,5 +307,34 @@ impl Node {
         Ok(tokio::spawn(async move {
             node.run().instrument(info_span!("logic", name)).await
         }))
+    }
+}
+
+#[cfg(test)]
+mod test {
+    use drmem_api::device;
+    use tokio::{sync::mpsc, task};
+
+    #[tokio::test]
+    async fn test_send() {
+        let (tx, mut rx) = mpsc::channel(10);
+        let mut o = super::Output::create(tx);
+        let h = task::spawn(async move {
+            assert_eq!(o.send(device::Value::Bool(true)).await, true);
+            assert_eq!(o.send(device::Value::Bool(true)).await, true);
+            assert_eq!(o.send(device::Value::Bool(false)).await, true);
+        });
+
+        let (v, tx) = rx.recv().await.unwrap();
+
+        assert_eq!(v, device::Value::Bool(true));
+        assert!(tx.send(Ok(v)).is_ok());
+
+        let (v, tx) = rx.recv().await.unwrap();
+
+        assert_eq!(v, device::Value::Bool(false));
+        assert!(tx.send(Ok(v)).is_ok());
+
+        h.await.unwrap();
     }
 }
